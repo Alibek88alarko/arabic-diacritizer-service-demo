@@ -21,11 +21,11 @@ verified on the target host during deployment. The API, validator, store and tes
 ```powershell
 cd C:\services\diacritizer
 git clone <repo> .                # or copy the files
-py -3.11 -m venv .venv
-.\.venv\Scripts\python -m pip install -r requirements.txt
+uv venv --python 3.11 .venv       # uv: https://docs.astral.sh/uv/  (pip alternative: py -3.11 -m venv .venv)
+uv pip install -r requirements.txt --python .venv\Scripts\python.exe
 .\.venv\Scripts\python .venv\Scripts\pywin32_postinstall.py -install    # [W] once, for the pywin32 wrapper
 copy .env.example .env
-notepad .env                      # PROVIDERS, keys, port, paths (absolute paths are safest for a service)
+notepad .env                      # SERVICE_KEY (same value in the ASP.NET API), PROVIDERS, keys, port, absolute paths
 .\.venv\Scripts\python -m pytest -q     # must be green before anything is registered
 ```
 
@@ -87,7 +87,16 @@ sc.exe start DiacritizerAPI
 | 502 on every request | all providers failing (no network, bad key) | Check `logs\diacritizer.log`: each attempt is listed with the reason; keep `stub` last in `PROVIDERS` only for testing, never in production. |
 | 429 | daily character budget exhausted | Raise `DAILY_CHAR_BUDGET` or wait for the next UTC day; the counter is in the `usage` table. |
 
-## 7. Firewall
+## 7. Reachable only from the ASP.NET API
 
-The API binds to `127.0.0.1` by default. If the client's pipeline runs on another host, set `API_HOST=0.0.0.0`,
-open the port in Windows Defender Firewall for that source only, and put the service behind IIS or nginx with TLS.
+Two layers. First, the network: the service binds to `127.0.0.1` by default, which is enough when the ASP.NET API
+runs on the same host. If it runs elsewhere, set `API_HOST` to the private interface and allow only that caller:
+
+```powershell
+netsh advfirewall firewall add rule name="DiacritizerAPI from gateway" dir=in action=allow protocol=TCP localport=8080 remoteip=<gateway-ip>
+netsh advfirewall firewall add rule name="DiacritizerAPI block others" dir=in action=block protocol=TCP localport=8080
+```
+
+Second, the application: every route except `/health/live` requires the `X-Service-Key` header. Rotation
+without downtime: set the new value in `SERVICE_KEY`, move the old one to `SERVICE_KEY_PREVIOUS`, restart the
+service, update the ASP.NET API, then clear `SERVICE_KEY_PREVIOUS` and restart again.

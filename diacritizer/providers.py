@@ -96,6 +96,61 @@ class AnthropicProvider:
         return "".join(getattr(b, "text", "") for b in msg.content).strip("\n")
 
 
+class OpenAICompatibleProvider:
+    """Any provider that speaks the OpenAI chat-completions protocol (OpenAI, Azure, DeepSeek, local servers).
+
+    Configured entirely from the environment: base URL, model, key, timeout, retry count. Retries on
+    transport errors and 5xx responses; a 4xx is returned to the router at once (it will not get better).
+    """
+
+    name = "openai-compatible"
+
+    SYSTEM = ("You add full Arabic diacritics (tashkeel) to the user's text. Return the same text with "
+              "diacritics added and nothing else: no explanations, no quotes, no changes to letters, "
+              "punctuation, spacing or line breaks.")
+
+    def __init__(self, base_url: str, api_key: str, model: str, *, timeout_s: float = 20.0,
+                 retries: int = 1, transport=None, name: str | None = None):
+        import httpx
+
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.retries = max(0, retries)
+        if name:
+            self.name = name
+        self._client = httpx.Client(
+            base_url=self.base_url, timeout=timeout_s, transport=transport,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        )
+
+    def diacritize(self, text: str) -> str:
+        import httpx
+
+        payload = {
+            "model": self.model,
+            "temperature": 0,
+            "messages": [{"role": "system", "content": self.SYSTEM}, {"role": "user", "content": text}],
+        }
+        last: Exception | None = None
+        for attempt in range(self.retries + 1):
+            try:
+                r = self._client.post("/chat/completions", json=payload)
+            except httpx.HTTPError as exc:
+                last = exc
+                continue
+            if r.status_code >= 500:
+                last = RuntimeError(f"HTTP {r.status_code} from provider")
+                continue
+            if r.status_code >= 400:
+                raise RuntimeError(f"HTTP {r.status_code} from provider: {r.text[:200]}")
+            data = r.json()
+            try:
+                return data["choices"][0]["message"]["content"].strip("\n")
+            except (KeyError, IndexError, TypeError) as exc:
+                raise RuntimeError(f"unexpected response shape: {exc!r}")
+        raise RuntimeError(f"gave up after {self.retries + 1} attempt(s): {last!r}")
+
+
 @dataclass
 class RouteResult:
     text: str

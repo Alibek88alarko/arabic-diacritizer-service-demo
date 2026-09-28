@@ -32,8 +32,14 @@ class Settings:
     max_chars: int = 2000
     daily_char_budget: int = 200_000
     providers: list[str] = field(default_factory=lambda: ["stub"])
+    provider_retries: int = 1
+    service_key: str = "change-me"
+    service_key_previous: str = ""
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-haiku-4-5-20251001"
+    openai_base_url: str = ""
+    openai_api_key: str = ""
+    openai_model: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -48,8 +54,14 @@ class Settings:
             max_chars=int(e("MAX_CHARS", "2000")),
             daily_char_budget=int(e("DAILY_CHAR_BUDGET", "200000")),
             providers=[p.strip() for p in e("PROVIDERS", "stub").split(",") if p.strip()],
+            provider_retries=int(e("PROVIDER_RETRIES", "1")),
+            service_key=e("SERVICE_KEY", ""),
+            service_key_previous=e("SERVICE_KEY_PREVIOUS", ""),
             anthropic_api_key=e("ANTHROPIC_API_KEY", ""),
             anthropic_model=e("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
+            openai_base_url=e("OPENAI_BASE_URL", ""),
+            openai_api_key=e("OPENAI_API_KEY", ""),
+            openai_model=e("OPENAI_MODEL", ""),
         )
         Path(s.db_path).parent.mkdir(parents=True, exist_ok=True)
         Path(s.log_dir).mkdir(parents=True, exist_ok=True)

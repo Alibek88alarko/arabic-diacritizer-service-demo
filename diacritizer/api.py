@@ -1,20 +1,32 @@
-"""HTTP API. Three routes the client's pipeline needs: health, diacritize, corrections."""
+"""HTTP API behind the ASP.NET gateway: liveness, readiness, diacritize, corrections.
+
+Error mapping (what the gateway sees):
+    401  missing or invalid service key
+    404  correction for an unknown request id
+    413  text longer than MAX_CHARS
+    422  request body invalid, or a correction that changes base letters
+    429  daily character budget exhausted
+    502  every provider failed (exception, timeout or validator rejection); never a guessed answer
+"""
 from __future__ import annotations
 
 import logging
 import logging.handlers
+import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from . import __version__
-from .providers import AnthropicProvider, Router, RouterError, StubProvider
+from .auth import ServiceKeyAuth, require_service_key
+from .providers import AnthropicProvider, OpenAICompatibleProvider, Router, RouterError, StubProvider
 from .settings import Settings
 from .store import Store
 from .validate import check
 
 log = logging.getLogger("diacritizer")
+CORRELATION_HEADER = "X-Correlation-Id"
 
 
 class DiacritizeIn(BaseModel):
@@ -44,6 +56,12 @@ def build_providers(s: Settings):
                 log.warning("provider 'anthropic' listed but ANTHROPIC_API_KEY is empty; skipping")
                 continue
             out.append(AnthropicProvider(s.anthropic_api_key, s.anthropic_model, timeout_s=s.provider_timeout_s))
+        elif name == "openai":
+            if not (s.openai_base_url and s.openai_api_key and s.openai_model):
+                log.warning("provider 'openai' listed but OPENAI_BASE_URL/OPENAI_API_KEY/OPENAI_MODEL incomplete; skipping")
+                continue
+            out.append(OpenAICompatibleProvider(s.openai_base_url, s.openai_api_key, s.openai_model,
+                                                timeout_s=s.provider_timeout_s, retries=s.provider_retries))
         else:
             raise ValueError(f"unknown provider '{name}'")
     if not out:
@@ -77,25 +95,60 @@ def create_app(settings: Settings | None = None, *, providers=None, store: Store
     app = FastAPI(title="Arabic diacritizer API (demo)", version=__version__)
     app.state.store = store
     app.state.router = router
+    app.state.auth = ServiceKeyAuth(s.service_key, s.service_key_previous)
+    protected = [Depends(require_service_key)]
+
+    @app.middleware("http")
+    async def correlation(request: Request, call_next):
+        cid = request.headers.get(CORRELATION_HEADER) or uuid.uuid4().hex
+        request.state.correlation_id = cid
+        response = await call_next(request)
+        response.headers[CORRELATION_HEADER] = cid
+        return response
+
+    @app.get("/health/live")
+    def live():
+        return {"status": "ok", "version": __version__}
+
+    @app.get("/health/ready")
+    def ready():
+        """Configuration and storage check. Makes no paid provider call."""
+        problems = []
+        if not router.providers:
+            problems.append("no providers")
+        if [p.name for p in router.providers] == ["stub"] and s.providers != ["stub"]:
+            problems.append("only the stub provider is usable")
+        try:
+            store.chars_today()
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"store: {exc!r}")
+        if app.state.auth.current == "change-me":
+            problems.append("SERVICE_KEY is the placeholder")
+        body = {"status": "ok" if not problems else "degraded", "providers": [p.name for p in router.providers],
+                "problems": problems}
+        if problems:
+            raise HTTPException(status_code=503, detail=body)
+        return body
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "version": __version__, "providers": [p.name for p in router.providers]}
+        return live()
 
-    @app.post("/diacritize", response_model=DiacritizeOut)
-    def diacritize(body: DiacritizeIn):
+    @app.post("/diacritize", response_model=DiacritizeOut, dependencies=protected)
+    def diacritize(body: DiacritizeIn, request: Request):
+        cid = request.state.correlation_id
         try:
             res = router.run(body.text)
         except RouterError as exc:
             rid = store.save_request(body.text, None, None, ok=False, detail=str(exc))
-            log.warning("request %s failed: %s", rid, exc)
+            log.warning("cid=%s request %s failed: %s", cid, rid, exc)
             raise HTTPException(status_code=exc.status, detail={"request_id": rid, "error": str(exc)})
         rid = store.save_request(body.text, res.text, res.provider, ok=True, detail="; ".join(res.attempts))
-        log.info("request %s ok via %s in %d ms", rid, res.provider, res.elapsed_ms)
+        log.info("cid=%s request %s ok via %s in %d ms", cid, rid, res.provider, res.elapsed_ms)
         return DiacritizeOut(request_id=rid, text=res.text, provider=res.provider, elapsed_ms=res.elapsed_ms)
 
-    @app.post("/corrections", status_code=201)
-    def add_correction(body: CorrectionIn):
+    @app.post("/corrections", status_code=201, dependencies=protected)
+    def add_correction(body: CorrectionIn, request: Request):
         req = store.get_request(body.request_id)
         if req is None:
             raise HTTPException(status_code=404, detail="unknown request_id")
@@ -103,10 +156,10 @@ def create_app(settings: Settings | None = None, *, providers=None, store: Store
         if not verdict.ok:
             raise HTTPException(status_code=422, detail=f"correction changes the base text: {verdict.reason}")
         cid = store.save_correction(body.request_id, body.corrected_text, body.note)
-        log.info("correction %s saved for request %s", cid, body.request_id)
+        log.info("cid=%s correction %s saved for request %s", request.state.correlation_id, cid, body.request_id)
         return {"correction_id": cid}
 
-    @app.get("/corrections")
+    @app.get("/corrections", dependencies=protected)
     def list_corrections(since: str | None = Query(default=None, description="ISO-8601 UTC timestamp"),
                          limit: int = Query(default=100, ge=1, le=1000)):
         return {"items": store.list_corrections(since=since, limit=limit)}

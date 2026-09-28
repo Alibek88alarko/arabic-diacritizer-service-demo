@@ -10,16 +10,24 @@ from diacritizer.validate import check
 TEXT = "كتب الولد الدرس"
 
 
-@pytest.fixture
-def client(tmp_path):
-    s = Settings(db_path=str(tmp_path / "api.db"), log_dir=str(tmp_path / "logs"), provider_timeout_s=0.5)
-    app = create_app(s, providers=[FailingProvider(), StubProvider()], store=Store(s.db_path))
-    return TestClient(app)
-
-
-def test_health(client):
-    r = client.get("/health")
+def test_liveness_is_open_and_readiness_reports_config(client):
+    assert client.get("/health/live", headers={"X-Service-Key": ""}).status_code == 200
+    r = client.get("/health/ready")
     assert r.status_code == 200 and r.json()["providers"] == ["failing", "stub"]
+
+
+def test_readiness_fails_on_placeholder_key(tmp_path):
+    s = Settings(db_path=str(tmp_path / "r.db"), log_dir=str(tmp_path / "logs"))   # service_key = "change-me"
+    c = TestClient(create_app(s, providers=[StubProvider()], store=Store(s.db_path)))
+    r = c.get("/health/ready")
+    assert r.status_code == 503 and "placeholder" in r.json()["detail"]["problems"][0]
+
+
+def test_correlation_id_is_echoed_or_generated(client):
+    r = client.get("/health/live", headers={"X-Correlation-Id": "abc-123"})
+    assert r.headers["X-Correlation-Id"] == "abc-123"
+    r = client.get("/health/live")
+    assert len(r.headers["X-Correlation-Id"]) == 32
 
 
 def test_diacritize_returns_validated_text_and_persists_request(client):
@@ -54,9 +62,10 @@ def test_correction_for_unknown_request_is_404(client):
 
 
 def test_all_providers_down_gives_502_and_is_logged_as_failed_request(tmp_path):
-    s = Settings(db_path=str(tmp_path / "x.db"), log_dir=str(tmp_path / "logs"), provider_timeout_s=0.5)
+    s = Settings(db_path=str(tmp_path / "x.db"), log_dir=str(tmp_path / "logs"), provider_timeout_s=0.5,
+                 service_key="k")
     store = Store(s.db_path)
-    c = TestClient(create_app(s, providers=[FailingProvider()], store=store))
+    c = TestClient(create_app(s, providers=[FailingProvider()], store=store), headers={"X-Service-Key": "k"})
     r = c.post("/diacritize", json={"text": TEXT})
     assert r.status_code == 502
     rid = r.json()["detail"]["request_id"]
@@ -64,9 +73,10 @@ def test_all_providers_down_gives_502_and_is_logged_as_failed_request(tmp_path):
 
 
 def test_corrections_survive_restart(tmp_path):
-    s = Settings(db_path=str(tmp_path / "p.db"), log_dir=str(tmp_path / "logs"))
-    c1 = TestClient(create_app(s, providers=[StubProvider()], store=Store(s.db_path)))
+    s = Settings(db_path=str(tmp_path / "p.db"), log_dir=str(tmp_path / "logs"), service_key="k")
+    h = {"X-Service-Key": "k"}
+    c1 = TestClient(create_app(s, providers=[StubProvider()], store=Store(s.db_path)), headers=h)
     rid = c1.post("/diacritize", json={"text": TEXT}).json()["request_id"]
     c1.post("/corrections", json={"request_id": rid, "corrected_text": TEXT})
-    c2 = TestClient(create_app(s, providers=[StubProvider()], store=Store(s.db_path)))   # "restart"
+    c2 = TestClient(create_app(s, providers=[StubProvider()], store=Store(s.db_path)), headers=h)   # "restart"
     assert len(c2.get("/corrections").json()["items"]) == 1
